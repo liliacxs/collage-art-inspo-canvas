@@ -1,6 +1,8 @@
 import { Canvas, FabricImage, filters, Path, PencilBrush, util } from 'fabric';
 import type { FabricObject, TSimplePathData } from 'fabric';
 
+import { recolorLabels } from '@/editor/effects/clustering';
+import { applyColourFilter } from '@/editor/effects/palette';
 import type { CanvasObject, ColourClustering, CollageDocument, DrawingObject, ImageAsset, ImageObject } from '@/types/editor';
 
 import { ClusteringClient } from './ClusteringClient';
@@ -44,9 +46,26 @@ function imageSourceRect(object: ImageObject, asset: ImageAsset | undefined) {
   return { x: 0, y: 0, width: asset?.naturalWidth ?? object.width, height: asset?.naturalHeight ?? object.height };
 }
 
-function clusteringSignature(object: ImageObject, clustering: ColourClustering) {
+interface ClusteringState {
+  computeSignature: string; // identifies what `labels` was computed for (asset/crop/colours)
+  labels: Uint8Array;
+  width: number;
+  height: number;
+  bakedPaletteKey: string; // the palette currently baked into `clusteredCanvases`
+}
+
+// Identifies the cluster *structure* (which pixel belongs to which label) — the
+// part only a fresh k-means run can produce. Deliberately excludes the palette:
+// editing or applying a palette must NOT re-trigger the worker, only a rebake.
+function clusteringComputeSignature(object: ImageObject, clustering: ColourClustering) {
   const crop = object.crop ? `${object.crop.x},${object.crop.y},${object.crop.width}x${object.crop.height}` : 'full';
   return `${object.assetId}|${crop}|${clustering.colours}`;
+}
+
+// Identifies what's currently baked into `clusteredCanvases`: the raw palette plus
+// the colour filter multiplied over it at bake time.
+function bakeKeyFor(palette: string[], colourFilter: string | undefined) {
+  return `${palette.join('|')}::${colourFilter ?? ''}`;
 }
 
 function drawSourceToImageData(
@@ -96,9 +115,13 @@ export class CanvasController {
 
   // Colour clustering: the quantised result is derived, cached runtime state, never
   // written into the document (only `colourClustering.colours`/`palette` are stored).
+  // `labels` (which cluster each pixel belongs to) is the expensive, worker-computed
+  // part; recolouring labels through a palette is cheap and redone on the main
+  // thread whenever the palette changes (edited by hand, or a different one
+  // applied), without re-running k-means.
   private originalImageElements = new Map<string, HTMLImageElement>();
   private clusteredCanvases = new Map<string, HTMLCanvasElement>();
-  private clusteringSignatures = new Map<string, string>();
+  private clusteringState = new Map<string, ClusteringState>();
   private clusteringRequestByObject = new Map<string, number>();
   private clusteringDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private clusteringClient: ClusteringClient | null = null;
@@ -299,6 +322,13 @@ export class CanvasController {
   // filters. Used for both first creation and every later patch so those two paths
   // can never drift apart.
   private applyImageGeometryAndFilters(id: string, image: FabricImage, object: ImageObject, asset: ImageAsset | undefined) {
+    // Must run before resolveImageSource(): this is what actually rebakes
+    // `clusteredCanvases` for a changed palette (or schedules a worker run for a
+    // changed structure). Resolving the source first would read the cache as it
+    // stood before this reconcile — one edit behind.
+    if (asset) this.reconcileClustering(id, object, asset);
+    else this.forgetClusteringState(id);
+
     const resolved = this.resolveImageSource(id, object, asset);
     if (resolved.element && image.getElement() !== resolved.element) {
       image.setElement(resolved.element, { width: resolved.width, height: resolved.height });
@@ -336,9 +366,6 @@ export class CanvasController {
     }
 
     this.applyImageFilters(image, object);
-
-    if (asset) this.scheduleClusteringCompute(id, object, asset);
-    else this.forgetClusteringState(id);
   }
 
   private resolveImageSource(id: string, object: ImageObject, asset: ImageAsset | undefined) {
@@ -371,7 +398,10 @@ export class CanvasController {
     this.canvas.requestRenderAll();
   }
 
-  private scheduleClusteringCompute(id: string, object: ImageObject, asset: ImageAsset) {
+  // Decides whether the document's clustering state for this object requires a
+  // fresh (expensive, worker) k-means run, or just a (cheap, synchronous) rebake of
+  // already-computed labels against a changed palette.
+  private reconcileClustering(id: string, object: ImageObject, asset: ImageAsset) {
     const clustering = object.colourClustering;
     const existingTimer = this.clusteringDebounceTimers.get(id);
 
@@ -380,26 +410,36 @@ export class CanvasController {
         clearTimeout(existingTimer);
         this.clusteringDebounceTimers.delete(id);
       }
+      this.clusteringState.delete(id);
+      this.clusteredCanvases.delete(id);
       return;
     }
 
-    const signature = clusteringSignature(object, clustering);
-    if (this.clusteringSignatures.get(id) === signature) return;
+    const computeSignature = clusteringComputeSignature(object, clustering);
+    const state = this.clusteringState.get(id);
 
-    if (existingTimer) clearTimeout(existingTimer);
-    const timer = setTimeout(() => {
-      this.clusteringDebounceTimers.delete(id);
-      void this.runClustering(id, signature, clustering.colours, asset);
-    }, CLUSTER_DEBOUNCE_MS);
-    this.clusteringDebounceTimers.set(id, timer);
+    if (!state || state.computeSignature !== computeSignature) {
+      if (existingTimer) clearTimeout(existingTimer);
+      const timer = setTimeout(() => {
+        this.clusteringDebounceTimers.delete(id);
+        void this.runClustering(id, computeSignature, clustering.colours, asset);
+      }, CLUSTER_DEBOUNCE_MS);
+      this.clusteringDebounceTimers.set(id, timer);
+      return;
+    }
+
+    const paletteKey = bakeKeyFor(clustering.palette, clustering.colourFilter);
+    if (state.bakedPaletteKey !== paletteKey) {
+      this.bakeClusteredCanvas(id, state, clustering.palette, clustering.colourFilter);
+      state.bakedPaletteKey = paletteKey;
+    }
   }
 
-  private async runClustering(id: string, signature: string, colours: number, asset: ImageAsset) {
+  private async runClustering(id: string, computeSignature: string, colours: number, asset: ImageAsset) {
     const original = this.originalImageElements.get(id);
     const object = this.latestObjectsById.get(id);
     if (!original || !object || object.type !== 'image') return;
 
-    this.clusteringSignatures.set(id, signature);
     this.listeners.onClusteringPendingChanged(id, true);
 
     try {
@@ -413,25 +453,51 @@ export class CanvasController {
       const result = await promise;
       if (this.disposed || this.clusteringRequestByObject.get(id) !== requestId) return;
 
-      const canvas = document.createElement('canvas');
-      canvas.width = result.imageData.width;
-      canvas.height = result.imageData.height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      ctx.putImageData(result.imageData, 0, 0);
+      const latestObject = this.latestObjectsById.get(id);
+      const colourFilter = latestObject?.type === 'image' ? latestObject.colourClustering?.colourFilter : undefined;
 
-      this.clusteredCanvases.set(id, canvas);
+      const state: ClusteringState = {
+        computeSignature,
+        labels: result.labels,
+        width: result.width,
+        height: result.height,
+        bakedPaletteKey: bakeKeyFor(result.palette, colourFilter),
+      };
+      this.clusteringState.set(id, state);
+      this.bakeClusteredCanvas(id, state, result.palette, colourFilter);
+      // Writes into the store as object.colourClustering.palette; the next sync()
+      // will see bakedPaletteKey already matching it, so this doesn't re-bake.
       this.listeners.onClusteringPaletteComputed(id, result.palette);
 
       const fabricObject = this.objectsById.get(id);
-      const latestObject = this.latestObjectsById.get(id);
-      if (fabricObject && latestObject?.type === 'image') {
-        this.applyImageGeometryAndFilters(id, fabricObject as FabricImage, latestObject, this.assets[latestObject.assetId]);
+      // `latestObjectsById` is only refreshed inside sync(), so it doesn't yet know
+      // about the palette we just wrote via onClusteringPaletteComputed above —
+      // patch it in explicitly, or reconcileClustering would see a stale (possibly
+      // empty) palette below and immediately rebake over the one we just baked.
+      if (fabricObject && latestObject?.type === 'image' && latestObject.colourClustering) {
+        const patchedObject: ImageObject = {
+          ...latestObject,
+          colourClustering: { ...latestObject.colourClustering, palette: result.palette },
+        };
+        this.applyImageGeometryAndFilters(id, fabricObject as FabricImage, patchedObject, this.assets[patchedObject.assetId]);
         this.canvas.requestRenderAll();
       }
     } finally {
       this.listeners.onClusteringPendingChanged(id, false);
     }
+  }
+
+  private bakeClusteredCanvas(id: string, state: ClusteringState, palette: string[], colourFilter: string | undefined) {
+    const paletteRgb = applyColourFilter(palette, colourFilter);
+    const imageData = recolorLabels(state.labels, state.width, state.height, paletteRgb);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = state.width;
+    canvas.height = state.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.putImageData(imageData, 0, 0);
+    this.clusteredCanvases.set(id, canvas);
   }
 
   private getClusteringClient(): ClusteringClient {
@@ -441,7 +507,7 @@ export class CanvasController {
 
   private forgetClusteringState(id: string) {
     this.clusteredCanvases.delete(id);
-    this.clusteringSignatures.delete(id);
+    this.clusteringState.delete(id);
     this.clusteringRequestByObject.delete(id);
     const timer = this.clusteringDebounceTimers.get(id);
     if (timer) {

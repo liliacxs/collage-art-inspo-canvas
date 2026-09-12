@@ -12,7 +12,7 @@ export interface ClusterWorkerResponse {
   requestId: number;
   width: number;
   height: number;
-  buffer: ArrayBuffer;
+  labelsBuffer: ArrayBuffer;
   palette: string[];
 }
 
@@ -28,8 +28,8 @@ const scope = self as unknown as WorkerScope;
 scope.onmessage = (event) => {
   const { requestId, width, height, buffer, colours } = event.data;
   const data = new Uint8ClampedArray(buffer);
-  const { pixels, palette } = clusterImageData(data, width, height, colours);
+  const { labels, palette } = clusterImageData(data, width, height, colours);
 
-  const outBuffer = pixels.buffer as ArrayBuffer;
-  scope.postMessage({ requestId, width, height, buffer: outBuffer, palette }, [outBuffer]);
+  const labelsBuffer = labels.buffer as ArrayBuffer;
+  scope.postMessage({ requestId, width, height, labelsBuffer, palette }, [labelsBuffer]);
 };

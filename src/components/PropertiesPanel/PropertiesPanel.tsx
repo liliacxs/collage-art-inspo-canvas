@@ -23,6 +23,8 @@ export function PropertiesPanel() {
   const openCrop = useEditorStore((s) => s.openCrop);
   const setClusteringEnabled = useEditorStore((s) => s.setClusteringEnabled);
   const setClusteringColours = useEditorStore((s) => s.setClusteringColours);
+  const setClusteringPaletteColour = useEditorStore((s) => s.setClusteringPaletteColour);
+  const setClusteringColourFilter = useEditorStore((s) => s.setClusteringColourFilter);
   const isClusteringPending = useEditorStore((s) => (selectedId ? (s.clusteringPending[selectedId] ?? false) : false));
 
   if (!selectedId || !object) {
@@ -116,13 +118,39 @@ export function PropertiesPanel() {
                 {object.colourClustering.palette.length > 0 && (
                   <div className="flex flex-wrap gap-1 pt-1">
                     {object.colourClustering.palette.map((hex, index) => (
-                      <div
-                        key={`${hex}-${index}`}
-                        className="h-5 w-5 rounded border border-neutral-700"
-                        style={{ backgroundColor: hex }}
-                        title={hex}
+                      <input
+                        key={index}
+                        type="color"
+                        value={hex}
+                        title={`${hex} — click to edit`}
+                        className="h-5 w-5 cursor-pointer rounded border border-neutral-700 bg-transparent p-0"
+                        onChange={(e) => setClusteringPaletteColour(object.id, index, e.target.value)}
                       />
                     ))}
+                  </div>
+                )}
+
+                {object.colourClustering.palette.length > 0 && (
+                  <div className="flex flex-col gap-1 pt-1 text-neutral-300">
+                    <span className="text-neutral-500">Colour filter</span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="color"
+                        value={object.colourClustering.colourFilter ?? '#ffffff'}
+                        title="Multiply the palette by this colour"
+                        className="h-7 w-9 cursor-pointer rounded border border-neutral-700 bg-transparent p-0"
+                        onChange={(e) => setClusteringColourFilter(object.id, e.target.value)}
+                      />
+                      {object.colourClustering.colourFilter && (
+                        <button
+                          type="button"
+                          className="rounded bg-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-700"
+                          onClick={() => setClusteringColourFilter(object.id, undefined)}
+                        >
+                          Reset
+                        </button>
+                      )}
+                    </div>
                   </div>
                 )}
               </>

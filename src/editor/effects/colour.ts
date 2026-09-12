@@ -59,3 +59,8 @@ export function labToRgb(l: number, a: number, b: number): Rgb {
 export function rgbToHex(rgb: Rgb): string {
   return `#${rgb.map((channel) => Math.round(channel).toString(16).padStart(2, '0')).join('')}`;
 }
+
+export function hexToRgb(hex: string): Rgb {
+  const clean = hex.replace('#', '');
+  return [parseInt(clean.slice(0, 2), 16), parseInt(clean.slice(2, 4), 16), parseInt(clean.slice(4, 6), 16)];
+}

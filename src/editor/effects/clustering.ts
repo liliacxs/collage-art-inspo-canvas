@@ -1,8 +1,12 @@
-import { labToRgb, rgbToHex, rgbToLab, type Lab } from './colour';
+import { labToRgb, rgbToHex, rgbToLab, type Lab, type Rgb } from './colour';
 
 const MAX_SAMPLES = 4000;
 const MAX_ITERATIONS = 12;
 const CONVERGENCE_EPSILON = 0.5; // Lab units
+
+// Sentinel label for fully transparent pixels. Safe since colour counts top out at
+// 32 (real labels are 0..31), so it can live in the same Uint8Array as real labels.
+const TRANSPARENT_LABEL = 255;
 
 function distanceSq(a: Lab, b: Lab): number {
   const dl = a[0] - b[0];
@@ -89,14 +93,12 @@ function runKMeans(samples: Lab[], k: number): Lab[] {
   return centroids;
 }
 
-const TRANSPARENT_LABEL = -1;
-
-// Nearest-centroid label per pixel (not yet recoloured). Flat/illustration-style
-// source images repeat exact RGB values constantly; caching the lookup per distinct
-// colour avoids re-searching every single pixel and is a large win on that common case.
-function assignLabels(data: Uint8ClampedArray, centroids: Lab[]): Int16Array {
+// Nearest-centroid label per pixel. Flat/illustration-style source images repeat
+// exact RGB values constantly; caching the lookup per distinct colour avoids
+// re-searching every single pixel and is a large win on that common case.
+function assignLabels(data: Uint8ClampedArray, centroids: Lab[]): Uint8Array {
   const pixelCount = data.length / 4;
-  const labels = new Int16Array(pixelCount);
+  const labels = new Uint8Array(pixelCount);
   const cache = new Map<number, number>();
 
   for (let p = 0; p < pixelCount; p++) {
@@ -134,12 +136,12 @@ function assignLabels(data: Uint8ClampedArray, centroids: Lab[]): Int16Array {
 // behind low-k graininess — quantization is otherwise per-pixel and ignores
 // neighbours entirely, so pixels near a cluster boundary (which covers more of the
 // image's colour range when k is small) speckle independently of their neighbours.
-function despeckleLabels(labels: Int16Array, width: number, height: number, clusterCount: number, passes: number): Int16Array {
+function despeckleLabels(labels: Uint8Array, width: number, height: number, clusterCount: number, passes: number): Uint8Array {
   let current = labels;
   const counts = new Int32Array(clusterCount);
 
   for (let pass = 0; pass < passes; pass++) {
-    const next = new Int16Array(current.length);
+    const next = new Uint8Array(current.length);
 
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
@@ -189,43 +191,47 @@ function despecklePassesFor(colours: number): number {
 }
 
 export interface ClusterResult {
-  pixels: Uint8ClampedArray;
+  labels: Uint8Array;
+  width: number;
+  height: number;
   palette: string[];
 }
 
+// Computes which cluster each pixel belongs to, and a default palette (the
+// clusters' own centroid colours, dark -> light). Does NOT bake pixels — the
+// labels are the reusable, expensive-to-compute part; turning them into an actual
+// image (via `recolorLabels`) is cheap and redone on the main thread whenever the
+// palette changes (edited by hand, or a different palette applied), without
+// re-running k-means.
 export function clusterImageData(data: Uint8ClampedArray, width: number, height: number, colours: number): ClusterResult {
   const samples = samplePixels(data);
-  const centroids = runKMeans(samples, colours);
-  const centroidRgb = centroids.map((lab) => labToRgb(...lab));
+  const unsortedCentroids = runKMeans(samples, colours);
 
-  const labels = assignLabels(data, centroids);
+  // Sort once, up front, so label indices already match the palette's dark -> light
+  // display order — no separate remapping needed downstream.
+  const centroids = [...unsortedCentroids].sort((a, b) => a[0] - b[0]);
+  const palette = centroids.map((lab) => rgbToHex(labToRgb(...lab)));
+
+  const rawLabels = assignLabels(data, centroids);
   const passes = despecklePassesFor(colours);
-  const finalLabels = passes > 0 ? despeckleLabels(labels, width, height, centroids.length, passes) : labels;
+  const labels = passes > 0 ? despeckleLabels(rawLabels, width, height, centroids.length, passes) : rawLabels;
 
-  const pixels = new Uint8ClampedArray(data.length);
-  for (let p = 0; p < finalLabels.length; p++) {
+  return { labels, width, height, palette };
+}
+
+// The cheap half of the pipeline: turns cluster labels + a palette (the default one,
+// a hand-edited one, or an entirely different applied one) into actual pixels.
+export function recolorLabels(labels: Uint8Array, width: number, height: number, palette: Rgb[]): ImageData {
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  for (let p = 0; p < labels.length; p++) {
     const i = p * 4;
-    const label = finalLabels[p];
-    if (label === TRANSPARENT_LABEL) {
-      pixels[i] = data[i];
-      pixels[i + 1] = data[i + 1];
-      pixels[i + 2] = data[i + 2];
-      pixels[i + 3] = data[i + 3];
-      continue;
-    }
-    const rgb = centroidRgb[label];
-    pixels[i] = rgb[0];
-    pixels[i + 1] = rgb[1];
-    pixels[i + 2] = rgb[2];
-    pixels[i + 3] = data[i + 3];
+    const label = labels[p];
+    if (label === TRANSPARENT_LABEL || !palette[label]) continue; // stays [0,0,0,0]
+    const [r, g, b] = palette[label];
+    pixels[i] = r;
+    pixels[i + 1] = g;
+    pixels[i + 2] = b;
+    pixels[i + 3] = 255;
   }
-
-  // Palette is reported dark -> light, independent of the internal centroid order
-  // the recolour pass above relies on.
-  const palette = centroids
-    .map((lab, index) => ({ lab, index }))
-    .sort((a, b) => a.lab[0] - b.lab[0])
-    .map(({ index }) => rgbToHex(centroidRgb[index]));
-
-  return { pixels, palette };
+  return new ImageData(pixels, width, height);
 }

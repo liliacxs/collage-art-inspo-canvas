@@ -27,6 +27,7 @@ export interface ColourClustering {
   enabled: boolean;
   colours: number; // 4..32
   palette: string[]; // hex, dark -> light; populated once the worker resolves
+  colourFilter?: string; // hex; multiplied against the palette at bake time, not baked into it
 }
 
 export interface ImageObject extends CanvasObjectBase {

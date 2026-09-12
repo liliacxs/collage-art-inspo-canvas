@@ -1,7 +1,9 @@
 import type { ClusterWorkerRequest, ClusterWorkerResponse } from '@/workers/clustering.worker';
 
 export interface ClusterComputeResult {
-  imageData: ImageData;
+  labels: Uint8Array;
+  width: number;
+  height: number;
   palette: string[];
 }
 
@@ -17,11 +19,11 @@ export class ClusteringClient {
   constructor() {
     this.worker = new Worker(new URL('../../workers/clustering.worker.ts', import.meta.url), { type: 'module' });
     this.worker.onmessage = (event: MessageEvent<ClusterWorkerResponse>) => {
-      const { requestId, width, height, buffer, palette } = event.data;
+      const { requestId, width, height, labelsBuffer, palette } = event.data;
       const request = this.pending.get(requestId);
       if (!request) return; // cancelled or superseded; drop silently
       this.pending.delete(requestId);
-      request.resolve({ imageData: new ImageData(new Uint8ClampedArray(buffer), width, height), palette });
+      request.resolve({ labels: new Uint8Array(labelsBuffer), width, height, palette });
     };
   }
 

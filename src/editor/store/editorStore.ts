@@ -69,6 +69,8 @@ interface EditorState {
   setClusteringColours: (id: string, colours: number) => void;
   setClusteringPalette: (id: string, palette: string[]) => void;
   setClusteringPending: (id: string, pending: boolean) => void;
+  setClusteringPaletteColour: (id: string, index: number, hex: string) => void;
+  setClusteringColourFilter: (id: string, hex: string | undefined) => void;
 }
 
 function pushHistory(past: CollageDocument[], current: CollageDocument): CollageDocument[] {
@@ -319,5 +321,34 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
   setClusteringPending: (id, pending) => {
     set((state) => ({ clusteringPending: { ...state.clusteringPending, [id]: pending } }));
+  },
+
+  setClusteringPaletteColour: (id, index, hex) => {
+    set((state) => {
+      const object = state.document.objects.find((o) => o.id === id);
+      if (!object || object.type !== 'image' || !object.colourClustering) return state;
+      if (index < 0 || index >= object.colourClustering.palette.length) return state;
+      const palette = [...object.colourClustering.palette];
+      palette[index] = hex;
+      const clustering = object.colourClustering;
+      return (
+        withObjectUpdate(state, id, (o) => ({ ...o, colourClustering: { ...clustering, palette } }) as ImageObject) ?? state
+      );
+    });
+  },
+
+  setClusteringColourFilter: (id, hex) => {
+    set((state) => {
+      const object = state.document.objects.find((o) => o.id === id);
+      if (!object || object.type !== 'image' || !object.colourClustering) return state;
+      const clustering = object.colourClustering;
+      return (
+        withObjectUpdate(
+          state,
+          id,
+          (o) => ({ ...o, colourClustering: { ...clustering, colourFilter: hex } }) as ImageObject,
+        ) ?? state
+      );
+    });
   },
 }));
