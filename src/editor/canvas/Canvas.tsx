@@ -18,6 +18,8 @@ export function EditorCanvas() {
   const selectObject = useEditorStore((s) => s.selectObject);
   const addDrawing = useEditorStore((s) => s.addDrawing);
   const deleteObject = useEditorStore((s) => s.deleteObject);
+  const setClusteringPalette = useEditorStore((s) => s.setClusteringPalette);
+  const setClusteringPending = useEditorStore((s) => s.setClusteringPending);
 
   useEffect(() => {
     if (!canvasElRef.current) return;
@@ -26,13 +28,15 @@ export function EditorCanvas() {
       onSelectionChanged: (id) => selectObject(id),
       onDrawingCreated: (drawing) => addDrawing({ ...drawing, type: 'drawing' }),
       onEraseObject: (id) => deleteObject(id),
+      onClusteringPaletteComputed: (id, palette) => setClusteringPalette(id, palette),
+      onClusteringPendingChanged: (id, pending) => setClusteringPending(id, pending),
     });
     controllerRef.current = controller;
     return () => {
       controller.dispose();
       controllerRef.current = null;
     };
-  }, [updateObject, selectObject, addDrawing, deleteObject]);
+  }, [updateObject, selectObject, addDrawing, deleteObject, setClusteringPalette, setClusteringPending]);
 
   useEffect(() => {
     controllerRef.current?.sync(document, assets);

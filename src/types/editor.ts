@@ -23,11 +23,18 @@ export interface ImageCrop {
   height: number;
 }
 
+export interface ColourClustering {
+  enabled: boolean;
+  colours: number; // 4..32
+  palette: string[]; // hex, dark -> light; populated once the worker resolves
+}
+
 export interface ImageObject extends CanvasObjectBase {
   type: 'image';
   assetId: string;
   filters: ImageFilters;
   crop?: ImageCrop;
+  colourClustering?: ColourClustering;
 }
 
 export interface DrawingObject extends CanvasObjectBase {

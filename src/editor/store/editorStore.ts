@@ -14,6 +14,9 @@ import type {
 
 const MAX_HISTORY = 50;
 const MAX_PLACED_DIMENSION = 500;
+const DEFAULT_CLUSTER_COLOURS = 12;
+const MIN_CLUSTER_COLOURS = 4;
+const MAX_CLUSTER_COLOURS = 32;
 
 const initialDocument: CollageDocument = {
   version: 1,
@@ -38,6 +41,10 @@ interface EditorState {
 
   cropTargetId: string | null;
 
+  // Ephemeral: whether a colour-clustering computation is currently running for an
+  // object. Lives outside `document` so it is never snapshotted into undo/redo.
+  clusteringPending: Record<string, boolean>;
+
   addImageFile: (file: File) => Promise<void>;
   addDrawing: (drawing: Omit<DrawingObject, 'id' | 'name' | 'opacity' | 'visible'>) => void;
   updateObject: (id: string, patch: TransformPatch) => void;
@@ -57,6 +64,11 @@ interface EditorState {
   openCrop: (id: string) => void;
   closeCrop: () => void;
   applyCrop: (id: string, crop: ImageCrop) => void;
+
+  setClusteringEnabled: (id: string, enabled: boolean) => void;
+  setClusteringColours: (id: string, colours: number) => void;
+  setClusteringPalette: (id: string, palette: string[]) => void;
+  setClusteringPending: (id: string, pending: boolean) => void;
 }
 
 function pushHistory(past: CollageDocument[], current: CollageDocument): CollageDocument[] {
@@ -92,6 +104,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   brushSize: 6,
 
   cropTargetId: null,
+  clusteringPending: {},
 
   addImageFile: async (file) => {
     const url = URL.createObjectURL(file);
@@ -257,5 +270,54 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       }));
       return updated ? { ...updated, cropTargetId: null } : state;
     });
+  },
+
+  setClusteringEnabled: (id, enabled) => {
+    set((state) => {
+      const object = state.document.objects.find((o) => o.id === id);
+      if (!object || object.type !== 'image') return state;
+      const current = object.colourClustering ?? { enabled: false, colours: DEFAULT_CLUSTER_COLOURS, palette: [] };
+      return (
+        withObjectUpdate(
+          state,
+          id,
+          (o) => ({ ...o, colourClustering: { ...current, enabled } }) as ImageObject,
+        ) ?? state
+      );
+    });
+  },
+
+  setClusteringColours: (id, colours) => {
+    const clamped = Math.round(Math.max(MIN_CLUSTER_COLOURS, Math.min(MAX_CLUSTER_COLOURS, colours)));
+    set((state) => {
+      const object = state.document.objects.find((o) => o.id === id);
+      if (!object || object.type !== 'image' || !object.colourClustering) return state;
+      const clustering = object.colourClustering;
+      return (
+        withObjectUpdate(
+          state,
+          id,
+          (o) => ({ ...o, colourClustering: { ...clustering, colours: clamped } }) as ImageObject,
+        ) ?? state
+      );
+    });
+  },
+
+  // Quiet update: reflects a background worker computation finishing, not a direct
+  // user edit, so it should not create an undo step.
+  setClusteringPalette: (id, palette) => {
+    set((state) => {
+      const index = state.document.objects.findIndex((o) => o.id === id);
+      if (index === -1) return state;
+      const object = state.document.objects[index];
+      if (object.type !== 'image' || !object.colourClustering) return state;
+      const objects = [...state.document.objects];
+      objects[index] = { ...object, colourClustering: { ...object.colourClustering, palette } };
+      return { document: { ...state.document, objects } };
+    });
+  },
+
+  setClusteringPending: (id, pending) => {
+    set((state) => ({ clusteringPending: { ...state.clusteringPending, [id]: pending } }));
   },
 }));

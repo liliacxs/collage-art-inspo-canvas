@@ -1,9 +1,13 @@
 import { Canvas, FabricImage, filters, Path, PencilBrush, util } from 'fabric';
 import type { FabricObject, TSimplePathData } from 'fabric';
 
-import type { CanvasObject, CollageDocument, DrawingObject, ImageAsset, ImageObject } from '@/types/editor';
+import type { CanvasObject, ColourClustering, CollageDocument, DrawingObject, ImageAsset, ImageObject } from '@/types/editor';
+
+import { ClusteringClient } from './ClusteringClient';
 
 const EPSILON = 0.01;
+const CLUSTER_DEBOUNCE_MS = 150;
+const CLUSTER_WORKING_MAX_DIMENSION = 400;
 
 export type CanvasTool = 'select' | 'draw' | 'erase';
 
@@ -31,6 +35,8 @@ export interface CanvasControllerListeners {
   onSelectionChanged: (id: string | null) => void;
   onDrawingCreated: (drawing: DrawingCreatedPayload) => void;
   onEraseObject: (id: string) => void;
+  onClusteringPaletteComputed: (id: string, palette: string[]) => void;
+  onClusteringPendingChanged: (id: string, pending: boolean) => void;
 }
 
 function imageSourceRect(object: ImageObject, asset: ImageAsset | undefined) {
@@ -38,8 +44,41 @@ function imageSourceRect(object: ImageObject, asset: ImageAsset | undefined) {
   return { x: 0, y: 0, width: asset?.naturalWidth ?? object.width, height: asset?.naturalHeight ?? object.height };
 }
 
+function clusteringSignature(object: ImageObject, clustering: ColourClustering) {
+  const crop = object.crop ? `${object.crop.x},${object.crop.y},${object.crop.width}x${object.crop.height}` : 'full';
+  return `${object.assetId}|${crop}|${clustering.colours}`;
+}
+
+function drawSourceToImageData(
+  image: HTMLImageElement,
+  sourceRect: { x: number; y: number; width: number; height: number },
+): ImageData {
+  const scale = Math.min(1, CLUSTER_WORKING_MAX_DIMENSION / Math.max(sourceRect.width, sourceRect.height));
+  const width = Math.max(1, Math.round(sourceRect.width * scale));
+  const height = Math.max(1, Math.round(sourceRect.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2D canvas context unavailable');
+  ctx.drawImage(image, sourceRect.x, sourceRect.y, sourceRect.width, sourceRect.height, 0, 0, width, height);
+  return ctx.getImageData(0, 0, width, height);
+}
+
 function filtersSignature(object: ImageObject) {
   return `${object.filters.brightness}|${object.filters.contrast}|${object.filters.saturation}`;
+}
+
+// Fabric's own getScaledWidth()/getScaledHeight() fold strokeWidth into the pre-scale size
+// (since strokeUniform defaults to false: displayWidth = (width + strokeWidth) * scaleX).
+// Scale must be derived the same way here, or every read-back/re-apply round trip (e.g. on
+// every drag) compounds a small inflation into runaway growth.
+function drawingIntrinsicSize(fabricObject: FabricObject) {
+  return {
+    width: (fabricObject.width || 0) + (fabricObject.strokeWidth || 0) || 1,
+    height: (fabricObject.height || 0) + (fabricObject.strokeWidth || 0) || 1,
+  };
 }
 
 export class CanvasController {
@@ -49,10 +88,20 @@ export class CanvasController {
   private idByObject = new WeakMap<FabricObject, string>();
   private pendingIds = new Set<string>();
   private assets: Record<string, ImageAsset> = {};
+  private latestObjectsById = new Map<string, CanvasObject>();
   private appliedFilterSignatures = new WeakMap<FabricObject, string>();
   private applyingSelection = false;
   private tool: CanvasTool = 'select';
   private disposed = false;
+
+  // Colour clustering: the quantised result is derived, cached runtime state, never
+  // written into the document (only `colourClustering.colours`/`palette` are stored).
+  private originalImageElements = new Map<string, HTMLImageElement>();
+  private clusteredCanvases = new Map<string, HTMLCanvasElement>();
+  private clusteringSignatures = new Map<string, string>();
+  private clusteringRequestByObject = new Map<string, number>();
+  private clusteringDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private clusteringClient: ClusteringClient | null = null;
 
   constructor(el: HTMLCanvasElement, listeners: CanvasControllerListeners) {
     this.listeners = listeners;
@@ -123,10 +172,14 @@ export class CanvasController {
         this.canvas.remove(fabricObject);
         this.objectsById.delete(id);
         this.idByObject.delete(fabricObject);
+        this.forgetClusteringState(id);
+        this.originalImageElements.delete(id);
+        this.latestObjectsById.delete(id);
       }
     }
 
     for (const object of document.objects) {
+      this.latestObjectsById.set(object.id, object);
       const existing = this.objectsById.get(object.id);
       if (existing) {
         this.applyPatch(existing, object);
@@ -178,6 +231,9 @@ export class CanvasController {
 
   dispose() {
     this.disposed = true;
+    for (const timer of this.clusteringDebounceTimers.values()) clearTimeout(timer);
+    this.clusteringDebounceTimers.clear();
+    this.clusteringClient?.dispose();
     this.canvas.dispose();
   }
 
@@ -203,23 +259,9 @@ export class CanvasController {
     const image = await FabricImage.fromURL(asset.url);
     if (this.disposed) return null;
 
-    const source = imageSourceRect(object, asset);
-    image.set({
-      left: object.x,
-      top: object.y,
-      angle: object.rotation,
-      opacity: object.opacity,
-      originX: 'left',
-      originY: 'top',
-      visible: object.visible,
-      cropX: source.x,
-      cropY: source.y,
-      width: source.width,
-      height: source.height,
-      scaleX: object.width / source.width,
-      scaleY: object.height / source.height,
-    });
-    this.applyImageFilters(image, object);
+    image.set({ originX: 'left', originY: 'top' });
+    this.originalImageElements.set(object.id, image.getElement() as HTMLImageElement);
+    this.applyImageGeometryAndFilters(object.id, image, object, asset);
     return image;
   }
 
@@ -236,25 +278,34 @@ export class CanvasController {
       strokeWidth: object.strokeWidth,
       fill: null,
     });
-    const scaleX = object.width / (path.width || 1);
-    const scaleY = object.height / (path.height || 1);
-    path.set({ scaleX, scaleY });
+    const intrinsic = drawingIntrinsicSize(path);
+    path.set({
+      scaleX: object.width / intrinsic.width,
+      scaleY: object.height / intrinsic.height,
+    });
     return path;
   }
 
   private applyPatch(fabricObject: FabricObject, object: CanvasObject) {
     if (object.type === 'image') {
-      this.applyImagePatch(fabricObject as FabricImage, object);
+      this.applyImageGeometryAndFilters(object.id, fabricObject as FabricImage, object, this.assets[object.assetId]);
     } else {
       applyDrawingPatch(fabricObject, object);
     }
   }
 
-  private applyImagePatch(image: FabricImage, object: ImageObject) {
-    const asset = this.assets[object.assetId];
-    const source = imageSourceRect(object, asset);
-    const scaleX = object.width / source.width;
-    const scaleY = object.height / source.height;
+  // The single place image objects reconcile against the document: source element
+  // (original asset vs. a cached clustered canvas), crop rect, transform, and
+  // filters. Used for both first creation and every later patch so those two paths
+  // can never drift apart.
+  private applyImageGeometryAndFilters(id: string, image: FabricImage, object: ImageObject, asset: ImageAsset | undefined) {
+    const resolved = this.resolveImageSource(id, object, asset);
+    if (resolved.element && image.getElement() !== resolved.element) {
+      image.setElement(resolved.element, { width: resolved.width, height: resolved.height });
+    }
+
+    const scaleX = object.width / resolved.width;
+    const scaleY = object.height / resolved.height;
 
     const changed =
       Math.abs((image.left ?? 0) - object.x) > EPSILON ||
@@ -263,8 +314,8 @@ export class CanvasController {
       Math.abs((image.opacity ?? 1) - object.opacity) > EPSILON ||
       Math.abs((image.scaleX ?? 1) - scaleX) > EPSILON ||
       Math.abs((image.scaleY ?? 1) - scaleY) > EPSILON ||
-      Math.abs((image.cropX ?? 0) - source.x) > EPSILON ||
-      Math.abs((image.cropY ?? 0) - source.y) > EPSILON ||
+      Math.abs((image.cropX ?? 0) - resolved.cropX) > EPSILON ||
+      Math.abs((image.cropY ?? 0) - resolved.cropY) > EPSILON ||
       image.visible !== object.visible;
 
     if (changed) {
@@ -274,10 +325,10 @@ export class CanvasController {
         angle: object.rotation,
         opacity: object.opacity,
         visible: object.visible,
-        cropX: source.x,
-        cropY: source.y,
-        width: source.width,
-        height: source.height,
+        cropX: resolved.cropX,
+        cropY: resolved.cropY,
+        width: resolved.width,
+        height: resolved.height,
         scaleX,
         scaleY,
       });
@@ -285,6 +336,24 @@ export class CanvasController {
     }
 
     this.applyImageFilters(image, object);
+
+    if (asset) this.scheduleClusteringCompute(id, object, asset);
+    else this.forgetClusteringState(id);
+  }
+
+  private resolveImageSource(id: string, object: ImageObject, asset: ImageAsset | undefined) {
+    const clustered = object.colourClustering?.enabled ? this.clusteredCanvases.get(id) : undefined;
+    if (clustered) {
+      return { element: clustered as HTMLImageElement | HTMLCanvasElement, cropX: 0, cropY: 0, width: clustered.width, height: clustered.height };
+    }
+    const source = imageSourceRect(object, asset);
+    return {
+      element: this.originalImageElements.get(id) as HTMLImageElement | HTMLCanvasElement | undefined,
+      cropX: source.x,
+      cropY: source.y,
+      width: source.width,
+      height: source.height,
+    };
   }
 
   private applyImageFilters(image: FabricImage, object: ImageObject) {
@@ -302,6 +371,85 @@ export class CanvasController {
     this.canvas.requestRenderAll();
   }
 
+  private scheduleClusteringCompute(id: string, object: ImageObject, asset: ImageAsset) {
+    const clustering = object.colourClustering;
+    const existingTimer = this.clusteringDebounceTimers.get(id);
+
+    if (!clustering?.enabled) {
+      if (existingTimer) {
+        clearTimeout(existingTimer);
+        this.clusteringDebounceTimers.delete(id);
+      }
+      return;
+    }
+
+    const signature = clusteringSignature(object, clustering);
+    if (this.clusteringSignatures.get(id) === signature) return;
+
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      this.clusteringDebounceTimers.delete(id);
+      void this.runClustering(id, signature, clustering.colours, asset);
+    }, CLUSTER_DEBOUNCE_MS);
+    this.clusteringDebounceTimers.set(id, timer);
+  }
+
+  private async runClustering(id: string, signature: string, colours: number, asset: ImageAsset) {
+    const original = this.originalImageElements.get(id);
+    const object = this.latestObjectsById.get(id);
+    if (!original || !object || object.type !== 'image') return;
+
+    this.clusteringSignatures.set(id, signature);
+    this.listeners.onClusteringPendingChanged(id, true);
+
+    try {
+      const sourceRect = imageSourceRect(object, asset);
+      const workingImageData = drawSourceToImageData(original, sourceRect);
+
+      const client = this.getClusteringClient();
+      const { requestId, promise } = client.compute(workingImageData, colours);
+      this.clusteringRequestByObject.set(id, requestId);
+
+      const result = await promise;
+      if (this.disposed || this.clusteringRequestByObject.get(id) !== requestId) return;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = result.imageData.width;
+      canvas.height = result.imageData.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.putImageData(result.imageData, 0, 0);
+
+      this.clusteredCanvases.set(id, canvas);
+      this.listeners.onClusteringPaletteComputed(id, result.palette);
+
+      const fabricObject = this.objectsById.get(id);
+      const latestObject = this.latestObjectsById.get(id);
+      if (fabricObject && latestObject?.type === 'image') {
+        this.applyImageGeometryAndFilters(id, fabricObject as FabricImage, latestObject, this.assets[latestObject.assetId]);
+        this.canvas.requestRenderAll();
+      }
+    } finally {
+      this.listeners.onClusteringPendingChanged(id, false);
+    }
+  }
+
+  private getClusteringClient(): ClusteringClient {
+    if (!this.clusteringClient) this.clusteringClient = new ClusteringClient();
+    return this.clusteringClient;
+  }
+
+  private forgetClusteringState(id: string) {
+    this.clusteredCanvases.delete(id);
+    this.clusteringSignatures.delete(id);
+    this.clusteringRequestByObject.delete(id);
+    const timer = this.clusteringDebounceTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      this.clusteringDebounceTimers.delete(id);
+    }
+  }
+
   private applyOrder(objects: CanvasObject[]) {
     objects.forEach((object, index) => {
       const fabricObject = this.objectsById.get(object.id);
@@ -311,8 +459,9 @@ export class CanvasController {
 }
 
 function applyDrawingPatch(fabricObject: FabricObject, object: DrawingObject) {
-  const targetScaleX = object.width / (fabricObject.width || 1);
-  const targetScaleY = object.height / (fabricObject.height || 1);
+  const intrinsic = drawingIntrinsicSize(fabricObject);
+  const targetScaleX = object.width / intrinsic.width;
+  const targetScaleY = object.height / intrinsic.height;
 
   const changed =
     Math.abs((fabricObject.left ?? 0) - object.x) > EPSILON ||
