@@ -25,6 +25,7 @@ export function PropertiesPanel() {
   const setClusteringColours = useEditorStore((s) => s.setClusteringColours);
   const setClusteringPaletteColour = useEditorStore((s) => s.setClusteringPaletteColour);
   const setClusteringColourFilter = useEditorStore((s) => s.setClusteringColourFilter);
+  const requestPaletteRegeneration = useEditorStore((s) => s.requestPaletteRegeneration);
   const isClusteringPending = useEditorStore((s) => (selectedId ? (s.clusteringPending[selectedId] ?? false) : false));
 
   if (!selectedId || !object) {
@@ -153,6 +154,26 @@ export function PropertiesPanel() {
                     </div>
                   </div>
                 )}
+
+                {(() => {
+                  const hasAdjustmentsToBake =
+                    object.colourClustering.palette.length > 0 &&
+                    (Boolean(object.colourClustering.colourFilter) ||
+                      object.filters.brightness !== 0 ||
+                      object.filters.contrast !== 0 ||
+                      object.filters.saturation !== 0);
+                  return (
+                    <button
+                      type="button"
+                      className="mt-1 rounded bg-neutral-800 px-2 py-1.5 text-neutral-200 hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={!hasAdjustmentsToBake}
+                      title="Freeze the current colour filter and brightness/contrast/saturation into the palette, then reset those adjustments"
+                      onClick={() => requestPaletteRegeneration(object.id)}
+                    >
+                      Regenerate palette
+                    </button>
+                  );
+                })()}
               </>
             )}
           </div>

@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react';
 
+import { CanvasSettingsModal } from '@/components/CanvasSettingsModal/CanvasSettingsModal';
 import { CropModal } from '@/components/CropModal/CropModal';
 import { LayersPanel } from '@/components/LayersPanel/LayersPanel';
 import { PropertiesPanel } from '@/components/PropertiesPanel/PropertiesPanel';
@@ -43,6 +44,7 @@ function App() {
         <PropertiesPanel />
       </div>
       <CropModal />
+      <CanvasSettingsModal />
     </div>
   );
 }

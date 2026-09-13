@@ -2,6 +2,7 @@ import { Canvas, FabricImage, filters, Path, PencilBrush, util } from 'fabric';
 import type { FabricObject, TSimplePathData } from 'fabric';
 
 import { recolorLabels } from '@/editor/effects/clustering';
+import { rgbToHex } from '@/editor/effects/colour';
 import { applyColourFilter } from '@/editor/effects/palette';
 import type { CanvasObject, ColourClustering, CollageDocument, DrawingObject, ImageAsset, ImageObject } from '@/types/editor';
 
@@ -39,6 +40,7 @@ export interface CanvasControllerListeners {
   onEraseObject: (id: string) => void;
   onClusteringPaletteComputed: (id: string, palette: string[]) => void;
   onClusteringPendingChanged: (id: string, pending: boolean) => void;
+  onPaletteRegenerated: (id: string, palette: string[]) => void;
 }
 
 function imageSourceRect(object: ImageObject, asset: ImageAsset | undefined) {
@@ -89,6 +91,25 @@ function filtersSignature(object: ImageObject) {
   return `${object.filters.brightness}|${object.filters.contrast}|${object.filters.saturation}`;
 }
 
+// Fabric's 2D filters only read `imageData` off the options object they're given
+// (see e.g. Brightness.applyTo2d), so a minimal object covers it without needing
+// the full T2DPipelineState (canvas/context/backend) Fabric normally supplies —
+// that shape isn't exported from the package anyway.
+interface Minimal2dFilter {
+  applyTo2d(options: { imageData: ImageData }): void;
+}
+
+// Applies brightness/contrast/saturation to a (typically palette-sized) ImageData
+// using Fabric's own filter math via applyTo2d, so "regenerate palette" reproduces
+// the exact on-screen colour rather than an approximation of it.
+function applyImageFiltersToImageData(imageData: ImageData, imageFilters: ImageObject['filters']) {
+  const active: Minimal2dFilter[] = [];
+  if (imageFilters.brightness !== 0) active.push(new filters.Brightness({ brightness: imageFilters.brightness }));
+  if (imageFilters.contrast !== 0) active.push(new filters.Contrast({ contrast: imageFilters.contrast }));
+  if (imageFilters.saturation !== 0) active.push(new filters.Saturation({ saturation: imageFilters.saturation }));
+  for (const filter of active) filter.applyTo2d({ imageData });
+}
+
 // Fabric's own getScaledWidth()/getScaledHeight() fold strokeWidth into the pre-scale size
 // (since strokeUniform defaults to false: displayWidth = (width + strokeWidth) * scaleX).
 // Scale must be derived the same way here, or every read-back/re-apply round trip (e.g. on
@@ -111,6 +132,7 @@ export class CanvasController {
   private appliedFilterSignatures = new WeakMap<FabricObject, string>();
   private applyingSelection = false;
   private tool: CanvasTool = 'select';
+  private zoom = 1;
   private disposed = false;
 
   // Colour clustering: the quantised result is derived, cached runtime state, never
@@ -183,7 +205,10 @@ export class CanvasController {
     this.assets = assets;
 
     if (this.canvas.width !== document.canvas.width || this.canvas.height !== document.canvas.height) {
-      this.canvas.setDimensions({ width: document.canvas.width, height: document.canvas.height });
+      // backstoreOnly: the CSS (on-screen) size is driven separately by `zoom` —
+      // a plain setDimensions here would reset it back to 1:1, clobbering zoom.
+      this.canvas.setDimensions({ width: document.canvas.width, height: document.canvas.height }, { backstoreOnly: true });
+      this.applyZoom();
     }
     if (this.canvas.backgroundColor !== document.canvas.background) {
       this.canvas.backgroundColor = document.canvas.background;
@@ -250,6 +275,30 @@ export class CanvasController {
       this.canvas.discardActiveObject();
       this.canvas.requestRenderAll();
     }
+  }
+
+  // A purely visual (CSS-only) scale: the backstore pixel buffer — and therefore
+  // object coordinates, hit-testing, and export — is untouched. Fabric derives
+  // pointer positions from the ratio between the CSS size and the backstore size,
+  // so drawing/selecting/dragging all keep working correctly at any zoom level.
+  setZoom(zoom: number) {
+    if (this.disposed) return;
+    this.zoom = zoom;
+    this.applyZoom();
+  }
+
+  private applyZoom() {
+    this.canvas.setDimensions(
+      { width: this.canvas.width * this.zoom, height: this.canvas.height * this.zoom },
+      { cssOnly: true },
+    );
+  }
+
+  // Exports exactly what's on the Fabric canvas — the grid overlay lives in a
+  // separate DOM layer above it (see EditorCanvas), so it's never included here
+  // without any extra filtering.
+  exportPng(): Promise<Blob | null> {
+    return this.canvas.toBlob({ format: 'png', multiplier: 1 });
   }
 
   dispose() {
@@ -484,6 +533,57 @@ export class CanvasController {
       }
     } finally {
       this.listeners.onClusteringPendingChanged(id, false);
+    }
+  }
+
+  // Explicit, on-demand action outside the normal reconcile/debounce cycle:
+  // freezes each palette colour's exact current on-screen appearance — the
+  // colour filter multiplied in, then brightness/contrast/saturation applied,
+  // via Fabric's own filter math — as the new base palette, then resets those
+  // adjustments to neutral (left active, they'd apply a second time on top of
+  // the now-baked result). This deliberately does NOT re-run k-means: the
+  // existing labels (which pixel belongs to which cluster) are reused as-is, so
+  // a pixel's colour is guaranteed to match what was already on screen rather
+  // than drifting to whatever a fresh best-fit clustering happens to produce.
+  regeneratePalette(id: string) {
+    const object = this.latestObjectsById.get(id);
+    if (!object || object.type !== 'image' || !object.colourClustering?.enabled) return;
+    const clustering = object.colourClustering;
+    if (clustering.palette.length === 0) return;
+
+    const paletteRgb = applyColourFilter(clustering.palette, clustering.colourFilter);
+    const imageData = new ImageData(paletteRgb.length, 1);
+    paletteRgb.forEach(([r, g, b], i) => {
+      imageData.data[i * 4] = r;
+      imageData.data[i * 4 + 1] = g;
+      imageData.data[i * 4 + 2] = b;
+      imageData.data[i * 4 + 3] = 255;
+    });
+    applyImageFiltersToImageData(imageData, object.filters);
+
+    const newPalette = paletteRgb.map((_, i) => {
+      const offset = i * 4;
+      return rgbToHex([imageData.data[offset], imageData.data[offset + 1], imageData.data[offset + 2]]);
+    });
+
+    const state = this.clusteringState.get(id);
+    if (state) {
+      state.bakedPaletteKey = bakeKeyFor(newPalette, undefined);
+      this.bakeClusteredCanvas(id, state, newPalette, undefined);
+    }
+    // Writes the new palette and resets filters/colourFilter in the store as one
+    // update; the next sync() will see bakedPaletteKey already matching it.
+    this.listeners.onPaletteRegenerated(id, newPalette);
+
+    const fabricObject = this.objectsById.get(id);
+    if (fabricObject) {
+      const patchedObject: ImageObject = {
+        ...object,
+        filters: { brightness: 0, contrast: 0, saturation: 0 },
+        colourClustering: { ...clustering, palette: newPalette, colourFilter: undefined },
+      };
+      this.applyImageGeometryAndFilters(id, fabricObject as FabricImage, patchedObject, this.assets[patchedObject.assetId]);
+      this.canvas.requestRenderAll();
     }
   }
 

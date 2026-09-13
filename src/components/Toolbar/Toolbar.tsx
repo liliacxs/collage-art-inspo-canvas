@@ -25,6 +25,12 @@ export function Toolbar() {
   const setBrushColor = useEditorStore((s) => s.setBrushColor);
   const brushSize = useEditorStore((s) => s.brushSize);
   const setBrushSize = useEditorStore((s) => s.setBrushSize);
+  const openCanvasSettings = useEditorStore((s) => s.openCanvasSettings);
+  const requestExport = useEditorStore((s) => s.requestExport);
+  const zoom = useEditorStore((s) => s.zoom);
+  const zoomIn = useEditorStore((s) => s.zoomIn);
+  const zoomOut = useEditorStore((s) => s.zoomOut);
+  const resetZoom = useEditorStore((s) => s.resetZoom);
 
   const handleFiles = (files: FileList | null) => {
     if (!files) return;
@@ -120,6 +126,39 @@ export function Toolbar() {
         disabled={!selectedId}
       >
         Delete
+      </button>
+
+      <div className="mx-2 h-5 w-px bg-neutral-700" />
+
+      <div className="flex items-center overflow-hidden rounded border border-neutral-700">
+        <button type="button" className="px-2 py-1.5 hover:bg-neutral-800" onClick={zoomOut} title="Zoom out">
+          −
+        </button>
+        <button
+          type="button"
+          className="w-14 py-1.5 text-center hover:bg-neutral-800"
+          onClick={resetZoom}
+          title="Reset zoom to 100%"
+        >
+          {Math.round(zoom * 100)}%
+        </button>
+        <button type="button" className="px-2 py-1.5 hover:bg-neutral-800" onClick={zoomIn} title="Zoom in">
+          +
+        </button>
+      </div>
+
+      <div className="mx-2 h-5 w-px bg-neutral-700" />
+
+      <button type="button" className="rounded bg-neutral-800 px-3 py-1.5 hover:bg-neutral-700" onClick={openCanvasSettings}>
+        Canvas
+      </button>
+
+      <button
+        type="button"
+        className="ml-auto rounded bg-blue-600 px-3 py-1.5 text-white hover:bg-blue-500"
+        onClick={requestExport}
+      >
+        Save
       </button>
     </div>
   );

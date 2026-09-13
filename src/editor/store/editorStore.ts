@@ -17,6 +17,13 @@ const MAX_PLACED_DIMENSION = 500;
 const DEFAULT_CLUSTER_COLOURS = 12;
 const MIN_CLUSTER_COLOURS = 4;
 const MAX_CLUSTER_COLOURS = 32;
+const MIN_CANVAS_DIMENSION = 50;
+const MAX_CANVAS_DIMENSION = 4000;
+const MAX_GRID_LINES = 50;
+
+const ZOOM_STEPS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+const MIN_ZOOM = ZOOM_STEPS[0];
+const MAX_ZOOM = ZOOM_STEPS[ZOOM_STEPS.length - 1];
 
 const initialDocument: CollageDocument = {
   version: 1,
@@ -25,6 +32,14 @@ const initialDocument: CollageDocument = {
 };
 
 export type Tool = 'select' | 'draw' | 'erase';
+
+export interface GridSettings {
+  visible: boolean;
+  horizontalLines: number;
+  verticalLines: number;
+}
+
+const initialGrid: GridSettings = { visible: false, horizontalLines: 0, verticalLines: 0 };
 
 type TransformPatch = Partial<Pick<CanvasObjectBase, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'name'>>;
 
@@ -44,6 +59,25 @@ interface EditorState {
   // Ephemeral: whether a colour-clustering computation is currently running for an
   // object. Lives outside `document` so it is never snapshotted into undo/redo.
   clusteringPending: Record<string, boolean>;
+
+  // Ephemeral: a one-shot signal for CanvasController to regenerate an object's
+  // palette. The nonce (not the id alone) is what a listener diffs against, so
+  // repeated requests for the same object are still each detected.
+  paletteRegenerationRequest: { id: string; nonce: number } | null;
+
+  canvasSettingsOpen: boolean;
+
+  // Ephemeral: purely an editing aid, never part of the exported image, so it's
+  // not part of `document` and never pushed to undo history.
+  grid: GridSettings;
+
+  // Ephemeral: a one-shot signal for CanvasController to export the canvas. A
+  // plain nonce (no id needed — export always applies to the whole canvas).
+  exportRequest: number;
+
+  // Ephemeral: purely a view setting (CSS-only canvas scaling), never part of
+  // the document and never pushed to undo history. 1 = 100%.
+  zoom: number;
 
   addImageFile: (file: File) => Promise<void>;
   addDrawing: (drawing: Omit<DrawingObject, 'id' | 'name' | 'opacity' | 'visible'>) => void;
@@ -71,6 +105,24 @@ interface EditorState {
   setClusteringPending: (id: string, pending: boolean) => void;
   setClusteringPaletteColour: (id: string, index: number, hex: string) => void;
   setClusteringColourFilter: (id: string, hex: string | undefined) => void;
+  requestPaletteRegeneration: (id: string) => void;
+  applyRegeneratedPalette: (id: string, palette: string[]) => void;
+
+  openCanvasSettings: () => void;
+  closeCanvasSettings: () => void;
+  setCanvasSize: (width: number, height: number) => void;
+  setCanvasBackground: (color: string) => void;
+
+  setGridVisible: (visible: boolean) => void;
+  setGridHorizontalLines: (count: number) => void;
+  setGridVerticalLines: (count: number) => void;
+
+  requestExport: () => void;
+
+  setZoom: (zoom: number) => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+  resetZoom: () => void;
 }
 
 function pushHistory(past: CollageDocument[], current: CollageDocument): CollageDocument[] {
@@ -94,6 +146,27 @@ function withObjectUpdate(
   };
 }
 
+function withCanvasUpdate(
+  state: Pick<EditorState, 'document' | 'past'>,
+  updater: (canvas: CollageDocument['canvas']) => CollageDocument['canvas'],
+): Pick<EditorState, 'document' | 'past' | 'future'> {
+  return {
+    document: { ...state.document, canvas: updater(state.document.canvas) },
+    past: pushHistory(state.past, state.document),
+    future: [],
+  };
+}
+
+function clampNumber(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.round(Math.max(min, Math.min(max, value)));
+}
+
+function clampZoom(value: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
+}
+
 export const useEditorStore = create<EditorState>((set, get) => ({
   document: initialDocument,
   assets: {},
@@ -107,6 +180,11 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
   cropTargetId: null,
   clusteringPending: {},
+  paletteRegenerationRequest: null,
+  canvasSettingsOpen: false,
+  grid: initialGrid,
+  exportRequest: 0,
+  zoom: 1,
 
   addImageFile: async (file) => {
     const url = URL.createObjectURL(file);
@@ -351,4 +429,83 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       );
     });
   },
+
+  requestPaletteRegeneration: (id) => {
+    set((state) => ({
+      paletteRegenerationRequest: { id, nonce: (state.paletteRegenerationRequest?.nonce ?? 0) + 1 },
+    }));
+  },
+
+  // Folds the current colour filter and brightness/contrast/saturation into a
+  // freshly re-clustered palette, then resets those adjustments to neutral —
+  // otherwise they'd be applied a second time on top of the now-baked result.
+  applyRegeneratedPalette: (id, palette) => {
+    set((state) => {
+      const object = state.document.objects.find((o) => o.id === id);
+      if (!object || object.type !== 'image' || !object.colourClustering) return state;
+      const clustering = object.colourClustering;
+      return (
+        withObjectUpdate(
+          state,
+          id,
+          (o) =>
+            ({
+              ...o,
+              filters: { brightness: 0, contrast: 0, saturation: 0 },
+              colourClustering: { ...clustering, palette, colourFilter: undefined },
+            }) as ImageObject,
+        ) ?? state
+      );
+    });
+  },
+
+  openCanvasSettings: () => set({ canvasSettingsOpen: true }),
+  closeCanvasSettings: () => set({ canvasSettingsOpen: false }),
+
+  setCanvasSize: (width, height) => {
+    set((state) => {
+      const canvas = state.document.canvas;
+      const clampedWidth = clampNumber(width, MIN_CANVAS_DIMENSION, MAX_CANVAS_DIMENSION, canvas.width);
+      const clampedHeight = clampNumber(height, MIN_CANVAS_DIMENSION, MAX_CANVAS_DIMENSION, canvas.height);
+      return withCanvasUpdate(state, (c) => ({ ...c, width: clampedWidth, height: clampedHeight }));
+    });
+  },
+
+  setCanvasBackground: (color) => {
+    set((state) => withCanvasUpdate(state, (c) => ({ ...c, background: color })));
+  },
+
+  setGridVisible: (visible) => set((state) => ({ grid: { ...state.grid, visible } })),
+
+  setGridHorizontalLines: (count) => {
+    set((state) => ({
+      grid: { ...state.grid, horizontalLines: clampNumber(count, 0, MAX_GRID_LINES, state.grid.horizontalLines) },
+    }));
+  },
+
+  setGridVerticalLines: (count) => {
+    set((state) => ({
+      grid: { ...state.grid, verticalLines: clampNumber(count, 0, MAX_GRID_LINES, state.grid.verticalLines) },
+    }));
+  },
+
+  requestExport: () => set((state) => ({ exportRequest: state.exportRequest + 1 })),
+
+  setZoom: (zoom) => set((state) => ({ zoom: clampZoom(zoom, state.zoom) })),
+
+  zoomIn: () => {
+    set((state) => {
+      const next = ZOOM_STEPS.find((z) => z > state.zoom + 1e-6);
+      return { zoom: next ?? MAX_ZOOM };
+    });
+  },
+
+  zoomOut: () => {
+    set((state) => {
+      const next = [...ZOOM_STEPS].reverse().find((z) => z < state.zoom - 1e-6);
+      return { zoom: next ?? MIN_ZOOM };
+    });
+  },
+
+  resetZoom: () => set({ zoom: 1 }),
 }));
