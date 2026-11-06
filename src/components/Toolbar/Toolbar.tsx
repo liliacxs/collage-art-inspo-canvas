@@ -1,6 +1,8 @@
 import { useRef } from 'react';
 
 import { useEditorStore, type Tool } from '@/editor/store/editorStore';
+import { downloadBlob } from '@/lib/download';
+import { deserializeProject, serializeProject } from '@/lib/persistence';
 
 const TOOLS: { tool: Tool; label: string }[] = [
   { tool: 'select', label: 'Select' },
@@ -10,10 +12,13 @@ const TOOLS: { tool: Tool; label: string }[] = [
 
 export function Toolbar() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const projectFileInputRef = useRef<HTMLInputElement>(null);
 
   const addImageFile = useEditorStore((s) => s.addImageFile);
   const deleteSelected = useEditorStore((s) => s.deleteSelected);
-  const selectedId = useEditorStore((s) => s.selectedId);
+  const selectedIds = useEditorStore((s) => s.selectedIds);
+  const duplicateSelected = useEditorStore((s) => s.duplicateSelected);
+  const flipSelected = useEditorStore((s) => s.flipSelected);
   const undo = useEditorStore((s) => s.undo);
   const redo = useEditorStore((s) => s.redo);
   const canUndo = useEditorStore((s) => s.past.length > 0);
@@ -31,12 +36,33 @@ export function Toolbar() {
   const zoomIn = useEditorStore((s) => s.zoomIn);
   const zoomOut = useEditorStore((s) => s.zoomOut);
   const resetZoom = useEditorStore((s) => s.resetZoom);
+  const snapEnabled = useEditorStore((s) => s.snapEnabled);
+  const setSnapEnabled = useEditorStore((s) => s.setSnapEnabled);
+
+  const documentState = useEditorStore((s) => s.document);
+  const assetsState = useEditorStore((s) => s.assets);
+  const loadDocument = useEditorStore((s) => s.loadDocument);
 
   const handleFiles = (files: FileList | null) => {
     if (!files) return;
     Array.from(files)
       .filter((file) => file.type.startsWith('image/'))
       .forEach((file) => void addImageFile(file));
+  };
+
+  const handleSaveProject = async () => {
+    const json = await serializeProject(documentState, assetsState);
+    downloadBlob(new Blob([json], { type: 'application/json' }), `collage-${Date.now()}.json`);
+  };
+
+  const handleOpenProjectFile = async (file: File) => {
+    const text = await file.text();
+    const loaded = deserializeProject(text);
+    if (!loaded) {
+      window.alert('This file is not a valid art-editor project.');
+      return;
+    }
+    loadDocument(loaded.document, loaded.assets);
   };
 
   return (
@@ -59,6 +85,34 @@ export function Toolbar() {
         hidden
         onChange={(e) => {
           handleFiles(e.target.files);
+          e.target.value = '';
+        }}
+      />
+
+      <button
+        type="button"
+        className="rounded bg-neutral-800 px-3 py-1.5 hover:bg-neutral-700"
+        onClick={() => void handleSaveProject()}
+        title="Download the whole project as a .json file"
+      >
+        Save project
+      </button>
+      <button
+        type="button"
+        className="rounded bg-neutral-800 px-3 py-1.5 hover:bg-neutral-700"
+        onClick={() => projectFileInputRef.current?.click()}
+        title="Load a project from a .json file"
+      >
+        Open project
+      </button>
+      <input
+        ref={projectFileInputRef}
+        type="file"
+        accept="application/json"
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void handleOpenProjectFile(file);
           e.target.value = '';
         }}
       />
@@ -121,12 +175,47 @@ export function Toolbar() {
 
       <button
         type="button"
+        className="rounded px-3 py-1.5 hover:bg-neutral-800 disabled:opacity-40"
+        onClick={duplicateSelected}
+        disabled={selectedIds.length === 0}
+        title="Duplicate (Cmd/Ctrl+D)"
+      >
+        Duplicate
+      </button>
+      <button
+        type="button"
+        className="rounded px-3 py-1.5 hover:bg-neutral-800 disabled:opacity-40"
+        onClick={() => flipSelected('horizontal')}
+        disabled={selectedIds.length === 0}
+        title="Flip horizontal"
+      >
+        Flip H
+      </button>
+      <button
+        type="button"
+        className="rounded px-3 py-1.5 hover:bg-neutral-800 disabled:opacity-40"
+        onClick={() => flipSelected('vertical')}
+        disabled={selectedIds.length === 0}
+        title="Flip vertical"
+      >
+        Flip V
+      </button>
+
+      <button
+        type="button"
         className="rounded px-3 py-1.5 text-red-300 hover:bg-neutral-800 disabled:opacity-40"
         onClick={deleteSelected}
-        disabled={!selectedId}
+        disabled={selectedIds.length === 0}
       >
         Delete
       </button>
+
+      <div className="mx-2 h-5 w-px bg-neutral-700" />
+
+      <label className="flex items-center gap-1.5 px-1 text-neutral-300" title="Snap dragged objects to the grid, canvas edges/center, and other objects">
+        <input type="checkbox" checked={snapEnabled} onChange={(e) => setSnapEnabled(e.target.checked)} />
+        Snap
+      </label>
 
       <div className="mx-2 h-5 w-px bg-neutral-700" />
 
@@ -158,7 +247,7 @@ export function Toolbar() {
         className="ml-auto rounded bg-blue-600 px-3 py-1.5 text-white hover:bg-blue-500"
         onClick={requestExport}
       >
-        Save
+        Export PNG
       </button>
     </div>
   );

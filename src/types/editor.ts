@@ -8,6 +8,8 @@ export interface CanvasObjectBase {
   rotation: number;
   opacity: number;
   visible: boolean;
+  flipX: boolean;
+  flipY: boolean;
 }
 
 export interface ImageFilters {

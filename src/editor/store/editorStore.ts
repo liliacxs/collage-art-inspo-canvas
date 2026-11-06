@@ -3,6 +3,7 @@ import { create } from 'zustand';
 
 import { loadImageDimensions } from '@/lib/image';
 import type {
+  CanvasObject,
   CanvasObjectBase,
   CollageDocument,
   DrawingObject,
@@ -20,6 +21,9 @@ const MAX_CLUSTER_COLOURS = 32;
 const MIN_CANVAS_DIMENSION = 50;
 const MAX_CANVAS_DIMENSION = 4000;
 const MAX_GRID_LINES = 50;
+const DUPLICATE_OFFSET = 20;
+const NUDGE_STEP = 1;
+const NUDGE_STEP_LARGE = 10;
 
 const ZOOM_STEPS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const MIN_ZOOM = ZOOM_STEPS[0];
@@ -32,6 +36,9 @@ const initialDocument: CollageDocument = {
 };
 
 export type Tool = 'select' | 'draw' | 'erase';
+export type AlignMode = 'left' | 'right' | 'centerH' | 'top' | 'bottom' | 'centerV';
+export type DistributeAxis = 'horizontal' | 'vertical';
+export type FlipAxis = 'horizontal' | 'vertical';
 
 export interface GridSettings {
   visible: boolean;
@@ -43,10 +50,18 @@ const initialGrid: GridSettings = { visible: false, horizontalLines: 0, vertical
 
 type TransformPatch = Partial<Pick<CanvasObjectBase, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'name'>>;
 
+export interface MergedLayerResult {
+  url: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 interface EditorState {
   document: CollageDocument;
   assets: Record<string, ImageAsset>;
-  selectedId: string | null;
+  selectedIds: string[];
   past: CollageDocument[];
   future: CollageDocument[];
 
@@ -65,11 +80,19 @@ interface EditorState {
   // repeated requests for the same object are still each detected.
   paletteRegenerationRequest: { id: string; nonce: number } | null;
 
+  // Ephemeral: a one-shot signal for CanvasController to flatten a set of objects
+  // into a single baked image. Same nonce pattern as palette regeneration.
+  mergeRequest: { ids: string[]; nonce: number } | null;
+
   canvasSettingsOpen: boolean;
 
   // Ephemeral: purely an editing aid, never part of the exported image, so it's
   // not part of `document` and never pushed to undo history.
   grid: GridSettings;
+
+  // Ephemeral: whether dragging snaps to the grid, canvas edges/center, and other
+  // objects' edges. A view/interaction preference, not part of the document.
+  snapEnabled: boolean;
 
   // Ephemeral: a one-shot signal for CanvasController to export the canvas. A
   // plain nonce (no id needed — export always applies to the whole canvas).
@@ -80,16 +103,39 @@ interface EditorState {
   zoom: number;
 
   addImageFile: (file: File) => Promise<void>;
-  addDrawing: (drawing: Omit<DrawingObject, 'id' | 'name' | 'opacity' | 'visible'>) => void;
+  addDrawing: (drawing: Omit<DrawingObject, 'id' | 'name' | 'opacity' | 'visible' | 'flipX' | 'flipY'>) => void;
   updateObject: (id: string, patch: TransformPatch) => void;
+  updateObjectsPositions: (patches: { id: string; x: number; y: number }[]) => void;
   updateImageFilters: (id: string, patch: Partial<ImageFilters>) => void;
+  deleteObjects: (ids: string[]) => void;
   deleteObject: (id: string) => void;
   deleteSelected: () => void;
   selectObject: (id: string | null) => void;
+  selectObjects: (ids: string[]) => void;
+  toggleSelectObject: (id: string) => void;
+  toggleVisibility: (id: string) => void;
   bringForward: (id: string) => void;
   sendBackward: (id: string) => void;
   undo: () => void;
   redo: () => void;
+
+  duplicateSelected: () => void;
+  // Alt-drag: the object being dragged reports its pre-drag position (`origin`) and
+  // its dropped position (`movedPatch`) in one shot, so a clone can be inserted at
+  // the origin without ever writing to the document mid-gesture (see CanvasController).
+  duplicateAndMove: (
+    origin: { id: string; x: number; y: number },
+    movedId: string,
+    movedPatch: { x: number; y: number; width: number; height: number; rotation: number },
+  ) => void;
+
+  flipSelected: (axis: FlipAxis) => void;
+  nudgeSelected: (dx: number, dy: number) => void;
+  alignSelected: (mode: AlignMode) => void;
+  distributeSelected: (axis: DistributeAxis) => void;
+
+  requestMerge: (ids: string[]) => void;
+  applyMerge: (ids: string[], result: MergedLayerResult) => void;
 
   setTool: (tool: Tool) => void;
   setBrushColor: (color: string) => void;
@@ -116,6 +162,7 @@ interface EditorState {
   setGridVisible: (visible: boolean) => void;
   setGridHorizontalLines: (count: number) => void;
   setGridVerticalLines: (count: number) => void;
+  setSnapEnabled: (enabled: boolean) => void;
 
   requestExport: () => void;
 
@@ -123,6 +170,8 @@ interface EditorState {
   zoomIn: () => void;
   zoomOut: () => void;
   resetZoom: () => void;
+
+  loadDocument: (document: CollageDocument, assets: Record<string, ImageAsset>) => void;
 }
 
 function pushHistory(past: CollageDocument[], current: CollageDocument): CollageDocument[] {
@@ -167,10 +216,21 @@ function clampZoom(value: number, fallback: number): number {
   return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value));
 }
 
+// Bounding box union of a set of (unrotated) objects — align/distribute deliberately
+// work in this simplified space rather than each object's rotated screen bounds, so
+// results stay predictable when objects don't share a rotation.
+function boundsOf(objects: CanvasObject[]) {
+  const minX = Math.min(...objects.map((o) => o.x));
+  const minY = Math.min(...objects.map((o) => o.y));
+  const maxX = Math.max(...objects.map((o) => o.x + o.width));
+  const maxY = Math.max(...objects.map((o) => o.y + o.height));
+  return { minX, minY, maxX, maxY };
+}
+
 export const useEditorStore = create<EditorState>((set, get) => ({
   document: initialDocument,
   assets: {},
-  selectedId: null,
+  selectedIds: [],
   past: [],
   future: [],
 
@@ -181,8 +241,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   cropTargetId: null,
   clusteringPending: {},
   paletteRegenerationRequest: null,
+  mergeRequest: null,
   canvasSettingsOpen: false,
   grid: initialGrid,
+  snapEnabled: true,
   exportRequest: 0,
   zoom: 1,
 
@@ -208,13 +270,15 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       rotation: 0,
       opacity: 1,
       visible: true,
+      flipX: false,
+      flipY: false,
       filters: { brightness: 0, contrast: 0, saturation: 0 },
     };
 
     set((state) => ({
       assets: { ...state.assets, [asset.id]: asset },
       document: { ...state.document, objects: [...state.document.objects, object] },
-      selectedId: object.id,
+      selectedIds: [object.id],
       past: pushHistory(state.past, state.document),
       future: [],
     }));
@@ -227,10 +291,12 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       name: 'Drawing',
       opacity: 1,
       visible: true,
+      flipX: false,
+      flipY: false,
     };
     set((state) => ({
       document: { ...state.document, objects: [...state.document.objects, object] },
-      selectedId: object.id,
+      selectedIds: [object.id],
       past: pushHistory(state.past, state.document),
       future: [],
     }));
@@ -238,6 +304,24 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
   updateObject: (id, patch) => {
     set((state) => withObjectUpdate(state, id, (object) => ({ ...object, ...patch })) ?? state);
+  },
+
+  // Quiet, batched position update for a multi-object drag (see CanvasController's
+  // ActiveSelection handling) — one history entry for the whole gesture.
+  updateObjectsPositions: (patches) => {
+    set((state) => {
+      if (patches.length === 0) return state;
+      const patchById = new Map(patches.map((p) => [p.id, p]));
+      let touched = false;
+      const objects = state.document.objects.map((o) => {
+        const p = patchById.get(o.id);
+        if (!p) return o;
+        touched = true;
+        return { ...o, x: p.x, y: p.y };
+      });
+      if (!touched) return state;
+      return { document: { ...state.document, objects }, past: pushHistory(state.past, state.document), future: [] };
+    });
   },
 
   updateImageFilters: (id, patch) => {
@@ -253,25 +337,43 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     });
   },
 
-  deleteObject: (id) => {
+  deleteObjects: (ids) => {
+    set((state) => {
+      const idSet = new Set(ids);
+      if (!state.document.objects.some((o) => idSet.has(o.id))) return state;
+      return {
+        document: {
+          ...state.document,
+          objects: state.document.objects.filter((o) => !idSet.has(o.id)),
+        },
+        selectedIds: state.selectedIds.filter((id) => !idSet.has(id)),
+        cropTargetId: state.cropTargetId && idSet.has(state.cropTargetId) ? null : state.cropTargetId,
+        past: pushHistory(state.past, state.document),
+        future: [],
+      };
+    });
+  },
+
+  deleteObject: (id) => get().deleteObjects([id]),
+
+  deleteSelected: () => {
+    const { selectedIds, deleteObjects } = get();
+    if (selectedIds.length > 0) deleteObjects(selectedIds);
+  },
+
+  selectObject: (id) => set({ selectedIds: id ? [id] : [] }),
+  selectObjects: (ids) => set({ selectedIds: [...new Set(ids)] }),
+  toggleSelectObject: (id) => {
     set((state) => ({
-      document: {
-        ...state.document,
-        objects: state.document.objects.filter((o) => o.id !== id),
-      },
-      selectedId: state.selectedId === id ? null : state.selectedId,
-      cropTargetId: state.cropTargetId === id ? null : state.cropTargetId,
-      past: pushHistory(state.past, state.document),
-      future: [],
+      selectedIds: state.selectedIds.includes(id)
+        ? state.selectedIds.filter((existing) => existing !== id)
+        : [...state.selectedIds, id],
     }));
   },
 
-  deleteSelected: () => {
-    const { selectedId, deleteObject } = get();
-    if (selectedId) deleteObject(selectedId);
+  toggleVisibility: (id) => {
+    set((state) => withObjectUpdate(state, id, (o) => ({ ...o, visible: !o.visible })) ?? state);
   },
-
-  selectObject: (id) => set({ selectedId: id }),
 
   bringForward: (id) => {
     set((state) => {
@@ -321,6 +423,163 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         document: next,
         past: pushHistory(state.past, state.document),
         future: rest,
+      };
+    });
+  },
+
+  duplicateSelected: () => {
+    set((state) => {
+      const idSet = new Set(state.selectedIds);
+      const originals = state.document.objects.filter((o) => idSet.has(o.id));
+      if (originals.length === 0) return state;
+      const clones = originals.map((o) => ({
+        ...structuredClone(o),
+        id: nanoid(),
+        x: o.x + DUPLICATE_OFFSET,
+        y: o.y + DUPLICATE_OFFSET,
+      }));
+      return {
+        document: { ...state.document, objects: [...state.document.objects, ...clones] },
+        selectedIds: clones.map((c) => c.id),
+        past: pushHistory(state.past, state.document),
+        future: [],
+      };
+    });
+  },
+
+  duplicateAndMove: (origin, movedId, movedPatch) => {
+    set((state) => {
+      const index = state.document.objects.findIndex((o) => o.id === movedId);
+      if (index === -1) return state;
+      const clone = { ...structuredClone(state.document.objects[index]), id: nanoid(), x: origin.x, y: origin.y };
+      const objects = [...state.document.objects];
+      objects[index] = { ...objects[index], ...movedPatch };
+      objects.splice(index, 0, clone);
+      return {
+        document: { ...state.document, objects },
+        past: pushHistory(state.past, state.document),
+        future: [],
+      };
+    });
+  },
+
+  flipSelected: (axis) => {
+    set((state) => {
+      const idSet = new Set(state.selectedIds);
+      if (idSet.size === 0) return state;
+      const key = axis === 'horizontal' ? 'flipX' : 'flipY';
+      const objects = state.document.objects.map((o) => (idSet.has(o.id) ? { ...o, [key]: !o[key] } : o));
+      return { document: { ...state.document, objects }, past: pushHistory(state.past, state.document), future: [] };
+    });
+  },
+
+  nudgeSelected: (dx, dy) => {
+    set((state) => {
+      const idSet = new Set(state.selectedIds);
+      if (idSet.size === 0) return state;
+      const objects = state.document.objects.map((o) => (idSet.has(o.id) ? { ...o, x: o.x + dx, y: o.y + dy } : o));
+      return { document: { ...state.document, objects }, past: pushHistory(state.past, state.document), future: [] };
+    });
+  },
+
+  alignSelected: (mode) => {
+    set((state) => {
+      const idSet = new Set(state.selectedIds);
+      const targets = state.document.objects.filter((o) => idSet.has(o.id));
+      if (targets.length < 2) return state;
+      const { minX, minY, maxX, maxY } = boundsOf(targets);
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+
+      const objects = state.document.objects.map((o) => {
+        if (!idSet.has(o.id)) return o;
+        switch (mode) {
+          case 'left':
+            return { ...o, x: minX };
+          case 'right':
+            return { ...o, x: maxX - o.width };
+          case 'centerH':
+            return { ...o, x: centerX - o.width / 2 };
+          case 'top':
+            return { ...o, y: minY };
+          case 'bottom':
+            return { ...o, y: maxY - o.height };
+          case 'centerV':
+            return { ...o, y: centerY - o.height / 2 };
+        }
+      });
+      return { document: { ...state.document, objects }, past: pushHistory(state.past, state.document), future: [] };
+    });
+  },
+
+  distributeSelected: (axis) => {
+    set((state) => {
+      const idSet = new Set(state.selectedIds);
+      const targets = state.document.objects.filter((o) => idSet.has(o.id));
+      if (targets.length < 3) return state;
+
+      const posKey = axis === 'horizontal' ? 'x' : 'y';
+      const sizeKey = axis === 'horizontal' ? 'width' : 'height';
+      const sorted = [...targets].sort((a, b) => a[posKey] - b[posKey]);
+      const first = sorted[0];
+      const last = sorted[sorted.length - 1];
+      const totalSpan = last[posKey] + last[sizeKey] - first[posKey];
+      const totalSize = sorted.reduce((sum, o) => sum + o[sizeKey], 0);
+      const gap = (totalSpan - totalSize) / (sorted.length - 1);
+
+      const newPositions = new Map<string, number>();
+      let cursor = first[posKey] + first[sizeKey] + gap;
+      for (let i = 1; i < sorted.length - 1; i++) {
+        newPositions.set(sorted[i].id, cursor);
+        cursor += sorted[i][sizeKey] + gap;
+      }
+
+      const objects = state.document.objects.map((o) =>
+        newPositions.has(o.id) ? { ...o, [posKey]: newPositions.get(o.id)! } : o,
+      );
+      return { document: { ...state.document, objects }, past: pushHistory(state.past, state.document), future: [] };
+    });
+  },
+
+  requestMerge: (ids) => {
+    if (ids.length < 2) return;
+    set((state) => ({ mergeRequest: { ids, nonce: (state.mergeRequest?.nonce ?? 0) + 1 } }));
+  },
+
+  applyMerge: (ids, result) => {
+    set((state) => {
+      const assetId = nanoid();
+      const asset: ImageAsset = {
+        id: assetId,
+        url: result.url,
+        name: 'Merged layer',
+        naturalWidth: result.width,
+        naturalHeight: result.height,
+      };
+      const mergedObject: ImageObject = {
+        id: nanoid(),
+        type: 'image',
+        name: 'Merged layer',
+        assetId,
+        x: result.x,
+        y: result.y,
+        width: result.width,
+        height: result.height,
+        rotation: 0,
+        opacity: 1,
+        visible: true,
+        flipX: false,
+        flipY: false,
+        filters: { brightness: 0, contrast: 0, saturation: 0 },
+      };
+      const idSet = new Set(ids);
+      const objects = [...state.document.objects.filter((o) => !idSet.has(o.id)), mergedObject];
+      return {
+        assets: { ...state.assets, [assetId]: asset },
+        document: { ...state.document, objects },
+        selectedIds: [mergedObject.id],
+        past: pushHistory(state.past, state.document),
+        future: [],
       };
     });
   },
@@ -489,6 +748,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }));
   },
 
+  setSnapEnabled: (enabled) => set({ snapEnabled: enabled }),
+
   requestExport: () => set((state) => ({ exportRequest: state.exportRequest + 1 })),
 
   setZoom: (zoom) => set((state) => ({ zoom: clampZoom(zoom, state.zoom) })),
@@ -508,4 +769,17 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   resetZoom: () => set({ zoom: 1 }),
+
+  loadDocument: (document, assets) => {
+    set({
+      document,
+      assets,
+      selectedIds: [],
+      past: [],
+      future: [],
+      cropTargetId: null,
+    });
+  },
 }));
+
+export { NUDGE_STEP, NUDGE_STEP_LARGE };

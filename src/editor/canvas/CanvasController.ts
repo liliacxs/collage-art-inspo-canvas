@@ -1,9 +1,10 @@
-import { Canvas, FabricImage, filters, Path, PencilBrush, util } from 'fabric';
+import { ActiveSelection, Canvas, FabricImage, filters, Path, PencilBrush, util } from 'fabric';
 import type { FabricObject, TSimplePathData } from 'fabric';
 
 import { recolorLabels } from '@/editor/effects/clustering';
 import { rgbToHex } from '@/editor/effects/colour';
 import { applyColourFilter } from '@/editor/effects/palette';
+import type { GridSettings } from '@/editor/store/editorStore';
 import type { CanvasObject, ColourClustering, CollageDocument, DrawingObject, ImageAsset, ImageObject } from '@/types/editor';
 
 import { ClusteringClient } from './ClusteringClient';
@@ -11,6 +12,7 @@ import { ClusteringClient } from './ClusteringClient';
 const EPSILON = 0.01;
 const CLUSTER_DEBOUNCE_MS = 150;
 const CLUSTER_WORKING_MAX_DIMENSION = 400;
+const SNAP_THRESHOLD = 8;
 
 export type CanvasTool = 'select' | 'draw' | 'erase';
 
@@ -30,14 +32,38 @@ export interface DrawingCreatedPayload {
   strokeWidth: number;
 }
 
+export interface PositionPatch {
+  id: string;
+  x: number;
+  y: number;
+}
+
+export interface MergeResult {
+  blob: Blob;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface CanvasControllerListeners {
   onObjectTransformed: (
     id: string,
     patch: { x: number; y: number; width: number; height: number; rotation: number },
   ) => void;
-  onSelectionChanged: (id: string | null) => void;
+  // Fired once at the end of a multi-object (ActiveSelection) drag — translation only,
+  // since resize/rotate controls are disabled for multi-selections.
+  onObjectsTransformed: (patches: PositionPatch[]) => void;
+  onSelectionChanged: (ids: string[]) => void;
   onDrawingCreated: (drawing: DrawingCreatedPayload) => void;
   onEraseObject: (id: string) => void;
+  // Alt-drag duplicate: reported once, at drag end, alongside the dragged object's own
+  // new position — never mid-gesture (see the `pendingAltDuplicateOrigin` comment below).
+  onAltDragDuplicate: (
+    origin: PositionPatch,
+    movedId: string,
+    movedPatch: { x: number; y: number; width: number; height: number; rotation: number },
+  ) => void;
   onClusteringPaletteComputed: (id: string, palette: string[]) => void;
   onClusteringPendingChanged: (id: string, pending: boolean) => void;
   onPaletteRegenerated: (id: string, palette: string[]) => void;
@@ -121,6 +147,26 @@ function drawingIntrinsicSize(fabricObject: FabricObject) {
   };
 }
 
+// Picks whichever of an object's leading/center/trailing edge lands closest to a
+// candidate (grid line, canvas edge/center, another object's edge/center) within
+// `threshold`, and returns the resulting snapped position for `pos` — or null if
+// nothing is close enough to snap to.
+function snapAxis(pos: number, size: number, candidates: number[], threshold: number): number | null {
+  const points = [
+    { at: pos, offset: 0 },
+    { at: pos + size / 2, offset: size / 2 },
+    { at: pos + size, offset: size },
+  ];
+  let best: { dist: number; pos: number } | null = null;
+  for (const point of points) {
+    for (const candidate of candidates) {
+      const dist = Math.abs(point.at - candidate);
+      if (dist <= threshold && (!best || dist < best.dist)) best = { dist, pos: candidate - point.offset };
+    }
+  }
+  return best ? best.pos : null;
+}
+
 export class CanvasController {
   private canvas: Canvas;
   private listeners: CanvasControllerListeners;
@@ -134,6 +180,21 @@ export class CanvasController {
   private tool: CanvasTool = 'select';
   private zoom = 1;
   private disposed = false;
+
+  // The selection as last set by React (via `setSelection`), independent of whatever
+  // fabric's own ActiveSelection instance currently looks like — `sync()` rebuilds
+  // the fabric-level grouping from this on every document change (see `regroupSelection`).
+  private currentSelectionIds: string[] = [];
+  // Baseline for turning an ActiveSelection's own left/top delta (translation only —
+  // resize/rotate controls are disabled on it) into an absolute-coordinate patch for
+  // each member, without ever reading a member's own (group-relative) left/top.
+  private multiSelectDragOrigin: { left: number; top: number } | null = null;
+  // Armed on mouse:down when Alt is held over a single (non-grouped) object; consumed
+  // by the next object:modified for that same object. Deliberately NOT acted on until
+  // then — writing to the document mid-drag would fight the live drag (see `sync()`).
+  private pendingAltDuplicateOrigin: { id: string; x: number; y: number } | null = null;
+  private snapEnabled = true;
+  private snapGrid: GridSettings = { visible: false, horizontalLines: 0, verticalLines: 0 };
 
   // Colour clustering: the quantised result is derived, cached runtime state, never
   // written into the document (only `colourClustering.colours`/`palette` are stored).
@@ -154,27 +215,54 @@ export class CanvasController {
 
     this.canvas.on('object:modified', (event) => {
       const target = event.target;
-      const id = target && this.idByObject.get(target);
-      if (!target || !id) return;
-      this.listeners.onObjectTransformed(id, {
+      if (!target) return;
+
+      const altOrigin = this.pendingAltDuplicateOrigin;
+      this.pendingAltDuplicateOrigin = null;
+
+      if (target instanceof ActiveSelection) {
+        const origin = this.multiSelectDragOrigin;
+        this.multiSelectDragOrigin = { left: target.left ?? 0, top: target.top ?? 0 };
+        if (!origin) return;
+        const dx = (target.left ?? 0) - origin.left;
+        const dy = (target.top ?? 0) - origin.top;
+        if (Math.abs(dx) < EPSILON && Math.abs(dy) < EPSILON) return;
+
+        const patches: PositionPatch[] = [];
+        for (const member of target.getObjects()) {
+          const id = this.idByObject.get(member);
+          const original = id ? this.latestObjectsById.get(id) : undefined;
+          if (id && original) patches.push({ id, x: original.x + dx, y: original.y + dy });
+        }
+        if (patches.length) this.listeners.onObjectsTransformed(patches);
+        return;
+      }
+
+      const id = this.idByObject.get(target);
+      if (!id) return;
+      const patch = {
         x: target.left ?? 0,
         y: target.top ?? 0,
         width: target.getScaledWidth(),
         height: target.getScaledHeight(),
         rotation: target.angle ?? 0,
-      });
+      };
+      if (altOrigin && altOrigin.id === id) {
+        this.listeners.onAltDragDuplicate(altOrigin, id, patch);
+      } else {
+        this.listeners.onObjectTransformed(id, patch);
+      }
     });
 
     const handleSelection = (selected?: FabricObject[]) => {
       if (this.applyingSelection) return;
-      const target = selected?.[0];
-      const id = target ? this.idByObject.get(target) ?? null : null;
-      this.listeners.onSelectionChanged(id);
+      const ids = (selected ?? []).map((t) => this.idByObject.get(t)).filter((id): id is string => !!id);
+      this.listeners.onSelectionChanged(ids);
     };
     this.canvas.on('selection:created', (e) => handleSelection(e.selected));
     this.canvas.on('selection:updated', (e) => handleSelection(e.selected));
     this.canvas.on('selection:cleared', () => {
-      if (!this.applyingSelection) this.listeners.onSelectionChanged(null);
+      if (!this.applyingSelection) this.listeners.onSelectionChanged([]);
     });
 
     this.canvas.on('path:created', (event) => {
@@ -193,16 +281,47 @@ export class CanvasController {
     });
 
     this.canvas.on('mouse:down', (event) => {
-      if (this.tool !== 'erase') return;
+      if (this.tool === 'erase') {
+        const target = event.target;
+        const id = target && this.idByObject.get(target);
+        if (id) this.listeners.onEraseObject(id);
+        return;
+      }
+
+      this.pendingAltDuplicateOrigin = null;
+      if (this.tool !== 'select') return;
       const target = event.target;
-      const id = target && this.idByObject.get(target);
-      if (id) this.listeners.onEraseObject(id);
+      const altHeld = (event.e as MouseEvent).altKey ?? false;
+      if (!altHeld || !target || target instanceof ActiveSelection) return;
+      const id = this.idByObject.get(target);
+      const original = id ? this.latestObjectsById.get(id) : undefined;
+      if (id && original) this.pendingAltDuplicateOrigin = { id, x: original.x, y: original.y };
+    });
+
+    this.canvas.on('mouse:up', () => {
+      this.pendingAltDuplicateOrigin = null;
+    });
+
+    this.canvas.on('object:moving', (event) => {
+      const target = event.target;
+      if (!target || target instanceof ActiveSelection) return;
+      if (this.snapEnabled) this.applySnap(target, this.idByObject.get(target));
     });
   }
 
   sync(document: CollageDocument, assets: Record<string, ImageAsset>) {
     if (this.disposed) return;
     this.assets = assets;
+
+    // A live multi-selection groups its members with fabric-internal, group-relative
+    // coordinates. Reconciling geometry below always writes absolute document
+    // coordinates, so any such grouping must be torn down first — `regroupSelection()`
+    // rebuilds it at the end, once every member is back to an absolute position.
+    if (this.canvas.getActiveObject() instanceof ActiveSelection) {
+      this.applyingSelection = true;
+      this.canvas.discardActiveObject();
+      this.applyingSelection = false;
+    }
 
     if (this.canvas.width !== document.canvas.width || this.canvas.height !== document.canvas.height) {
       // backstoreOnly: the CSS (on-screen) size is driven separately by `zoom` —
@@ -238,20 +357,39 @@ export class CanvasController {
     }
 
     this.applyOrder(document.objects);
+    this.regroupSelection();
     this.canvas.requestRenderAll();
   }
 
-  setSelection(id: string | null) {
+  setSelection(ids: string[]) {
     if (this.disposed) return;
+    this.currentSelectionIds = ids;
+    this.regroupSelection();
+    this.canvas.requestRenderAll();
+  }
+
+  // Rebuilds fabric's active-object state from `currentSelectionIds` — filtering out
+  // any id that no longer exists (deleted/merged away). Always safe to call after any
+  // structural change; cheap even though it discards and recreates the ActiveSelection
+  // instance every time (see `sync()`'s call site).
+  private regroupSelection() {
+    const ids = this.currentSelectionIds.filter((id) => this.objectsById.has(id));
     this.applyingSelection = true;
     try {
-      const target = id ? this.objectsById.get(id) : undefined;
-      if (target) {
+      if (ids.length === 0) {
+        if (this.canvas.getActiveObject()) this.canvas.discardActiveObject();
+        this.multiSelectDragOrigin = null;
+      } else if (ids.length === 1) {
+        const target = this.objectsById.get(ids[0])!;
         if (this.canvas.getActiveObject() !== target) this.canvas.setActiveObject(target);
+        this.multiSelectDragOrigin = null;
       } else {
-        this.canvas.discardActiveObject();
+        const targets = ids.map((id) => this.objectsById.get(id)).filter((o): o is FabricObject => !!o);
+        const selection = new ActiveSelection(targets, { canvas: this.canvas });
+        selection.hasControls = false;
+        this.canvas.setActiveObject(selection);
+        this.multiSelectDragOrigin = { left: selection.left ?? 0, top: selection.top ?? 0 };
       }
-      this.canvas.requestRenderAll();
     } finally {
       this.applyingSelection = false;
     }
@@ -277,6 +415,14 @@ export class CanvasController {
     }
   }
 
+  setSnapEnabled(enabled: boolean) {
+    this.snapEnabled = enabled;
+  }
+
+  setGrid(grid: GridSettings) {
+    this.snapGrid = grid;
+  }
+
   // A purely visual (CSS-only) scale: the backstore pixel buffer — and therefore
   // object coordinates, hit-testing, and export — is untouched. Fabric derives
   // pointer positions from the ratio between the CSS size and the backstore size,
@@ -299,6 +445,45 @@ export class CanvasController {
   // without any extra filtering.
   exportPng(): Promise<Blob | null> {
     return this.canvas.toBlob({ format: 'png', multiplier: 1 });
+  }
+
+  // Flattens a set of objects into a single baked PNG, cropped to their combined
+  // bounding box. Requires the objects to be at the top level (not mid-grouped in a
+  // live ActiveSelection) since `filter` only sees the canvas's top-level objects —
+  // any active multi-selection is discarded first, same as `sync()` does.
+  async mergeObjects(ids: string[]): Promise<MergeResult | null> {
+    if (this.disposed) return null;
+    if (this.canvas.getActiveObject() instanceof ActiveSelection) {
+      this.applyingSelection = true;
+      this.canvas.discardActiveObject();
+      this.applyingSelection = false;
+      this.canvas.requestRenderAll();
+    }
+
+    const idSet = new Set(ids);
+    const targets = ids.map((id) => this.objectsById.get(id)).filter((o): o is FabricObject => !!o);
+    if (targets.length < 2) return null;
+
+    const rects = targets.map((t) => t.getBoundingRect());
+    const left = Math.min(...rects.map((r) => r.left));
+    const top = Math.min(...rects.map((r) => r.top));
+    const right = Math.max(...rects.map((r) => r.left + r.width));
+    const bottom = Math.max(...rects.map((r) => r.top + r.height));
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 || height <= 0) return null;
+
+    const blob = await this.canvas.toBlob({
+      format: 'png',
+      multiplier: 1,
+      left,
+      top,
+      width,
+      height,
+      filter: (obj) => idSet.has(this.idByObject.get(obj as unknown as FabricObject) ?? ''),
+    });
+    if (!blob) return null;
+    return { blob, x: left, y: top, width, height };
   }
 
   dispose() {
@@ -346,6 +531,8 @@ export class CanvasController {
       originX: 'left',
       originY: 'top',
       visible: object.visible,
+      flipX: object.flipX,
+      flipY: object.flipY,
       stroke: object.stroke,
       strokeWidth: object.strokeWidth,
       fill: null,
@@ -395,7 +582,9 @@ export class CanvasController {
       Math.abs((image.scaleY ?? 1) - scaleY) > EPSILON ||
       Math.abs((image.cropX ?? 0) - resolved.cropX) > EPSILON ||
       Math.abs((image.cropY ?? 0) - resolved.cropY) > EPSILON ||
-      image.visible !== object.visible;
+      image.visible !== object.visible ||
+      Boolean(image.flipX) !== object.flipX ||
+      Boolean(image.flipY) !== object.flipY;
 
     if (changed) {
       image.set({
@@ -404,6 +593,8 @@ export class CanvasController {
         angle: object.rotation,
         opacity: object.opacity,
         visible: object.visible,
+        flipX: object.flipX,
+        flipY: object.flipY,
         cropX: resolved.cropX,
         cropY: resolved.cropY,
         width: resolved.width,
@@ -622,6 +813,42 @@ export class CanvasController {
       if (fabricObject) this.canvas.moveObjectTo(fabricObject, index);
     });
   }
+
+  // Single-object drag snapping: candidates are the canvas edges/center, the visible
+  // grid lines, and every other object's edges/center — all in the same backstore
+  // pixel space as `document` coordinates, so the threshold behaves consistently
+  // regardless of zoom (a CSS-only transform, see `setZoom`).
+  private applySnap(target: FabricObject, movingId: string | undefined) {
+    const width = target.getScaledWidth();
+    const height = target.getScaledHeight();
+    const canvasWidth = this.canvas.width ?? 0;
+    const canvasHeight = this.canvas.height ?? 0;
+
+    const xCandidates = [0, canvasWidth / 2, canvasWidth];
+    const yCandidates = [0, canvasHeight / 2, canvasHeight];
+
+    if (this.snapGrid.visible) {
+      const { horizontalLines, verticalLines } = this.snapGrid;
+      for (let i = 1; i <= verticalLines; i++) xCandidates.push((canvasWidth * i) / (verticalLines + 1));
+      for (let i = 1; i <= horizontalLines; i++) yCandidates.push((canvasHeight * i) / (horizontalLines + 1));
+    }
+
+    for (const [id, object] of this.latestObjectsById) {
+      if (id === movingId) continue;
+      xCandidates.push(object.x, object.x + object.width / 2, object.x + object.width);
+      yCandidates.push(object.y, object.y + object.height / 2, object.y + object.height);
+    }
+
+    const snappedLeft = snapAxis(target.left ?? 0, width, xCandidates, SNAP_THRESHOLD);
+    const snappedTop = snapAxis(target.top ?? 0, height, yCandidates, SNAP_THRESHOLD);
+    if (snappedLeft !== null || snappedTop !== null) {
+      target.set({
+        ...(snappedLeft !== null ? { left: snappedLeft } : {}),
+        ...(snappedTop !== null ? { top: snappedTop } : {}),
+      });
+      target.setCoords();
+    }
+  }
 }
 
 function applyDrawingPatch(fabricObject: FabricObject, object: DrawingObject) {
@@ -636,7 +863,9 @@ function applyDrawingPatch(fabricObject: FabricObject, object: DrawingObject) {
     Math.abs((fabricObject.opacity ?? 1) - object.opacity) > EPSILON ||
     Math.abs((fabricObject.scaleX ?? 1) - targetScaleX) > EPSILON ||
     Math.abs((fabricObject.scaleY ?? 1) - targetScaleY) > EPSILON ||
-    fabricObject.visible !== object.visible;
+    fabricObject.visible !== object.visible ||
+    Boolean(fabricObject.flipX) !== object.flipX ||
+    Boolean(fabricObject.flipY) !== object.flipY;
 
   if (!changed) return;
   fabricObject.set({
@@ -645,6 +874,8 @@ function applyDrawingPatch(fabricObject: FabricObject, object: DrawingObject) {
     angle: object.rotation,
     opacity: object.opacity,
     visible: object.visible,
+    flipX: object.flipX,
+    flipY: object.flipY,
     scaleX: targetScaleX,
     scaleY: targetScaleY,
   });
